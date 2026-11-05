@@ -46,9 +46,12 @@ void __attribute__((interrupt)) SYSTICK_Handler() {
 
 uint64_t get_system_time() {	
 	uint64_t retval;
+	uint32_t primask;
+	__get_primask(&primask);
 	__disable_irq();
 	retval = tick_counter; 
 	__enable_irq(); 
+	__set_primask(primask);
 	return retval;
 }
 
