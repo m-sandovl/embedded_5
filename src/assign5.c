@@ -1,9 +1,7 @@
 /*
  * Author: Marc Sandoval
- * Purpose: Assignment 5 (EECE 558). Shows a BCD number X and its hex value Y
+ * Purpose: Assignment 5. Shows a BCD number X and its hex value Y
  * on the LCD. 'e' enters entry mode, digits fill X, '*' discards, Enter accepts.
- * lcd_fsm() runs from the systick callback; the application FSM is
- * asynchronous and runs every main-loop iteration.
  */
 #include "led.h"
 #include "lcd.h"
@@ -14,131 +12,143 @@
 #include <stdint.h>
 
 #define NUM_DIGITS 8
-#define X_FIRST_ADDR 0x03  
-#define Y_FIRST_ADDR 0x43
-#define LCD_SET_ADDR(a) ((uint8_t)(0x80 | (a)))
-#define LCD_DISPLAY_NO_CURSOR 0x0C
-#define LCD_DISPLAY_BLINK_CURSOR 0x0F
-#define PENDING_MAX 32
+#define BITS_PER_HEX_DIGIT 4
+#define HEX_DIGIT_MASK 0xF
+#define LABEL_LENGTH 3
+#define LINE_1_ADDRESS 0x00
+#define LINE_2_ADDRESS 0x40
+#define X_FIRST_DIGIT_ADDRESS (LINE_1_ADDRESS + LABEL_LENGTH)
+#define Y_FIRST_DIGIT_ADDRESS (LINE_2_ADDRESS + LABEL_LENGTH)
+#define LCD_SET_ADDRESS(address) ((uint8_t)(0x80 | (address)))
+#define LCD_CURSOR_OFF 0x0C
+#define LCD_CURSOR_BLINKING 0x0F
+#define LCD_FUNCTION_SET_4BIT_HANDSHAKE 0x32
+#define LCD_FUNCTION_SET_4BIT_2LINE 0x28
+#define LCD_CURSOR_SHIFT_LEFT 0x10
+#define LCD_ENTRY_MODE_INCREMENT 0x06
+#define LCD_CLEAR_DISPLAY 0x01
+#define MAX_LCD_ENTRIES_PER_KEY 19
 
-static struct { bool is_cmd; uint8_t value; } pending[PENDING_MAX];
-static uint8_t pending_len, pending_pos;
+static void bcd_entry_fsm( char key );
+static void show_initial_screen( void );
+static void show_text( const char *text );
+static void show_digits( const uint8_t digits[NUM_DIGITS] );
+static void show_hex( uint32_t value );
+static void start_digit_entry( void );
+static uint32_t digits_to_number( const uint8_t digits[NUM_DIGITS] );
+static char hex_digit_character( uint8_t value );
 
-static void put_cmd( uint8_t c )  { pending[pending_len].is_cmd = true;  pending[pending_len++].value = c; }
-static void put_char( char c )    { pending[pending_len].is_cmd = false; pending[pending_len++].value = (uint8_t)c; }
-static char hex_char( uint8_t v ) { return v < 10 ? (char)('0' + v) : (char)('A' + (v - 10)); }
-
-static void flush_pending( void ) {
-	while( pending_pos < pending_len ) {
-		bool ok = pending[pending_pos].is_cmd
-			? lcd_command( pending[pending_pos].value )
-			: lcd_putchar( (char)pending[pending_pos].value );
-		if( !ok )
-			return;
-		pending_pos++;
-	}
-	pending_len = 0;
-	pending_pos = 0;
-}
- 
-static void queue_x_digits( uint32_t value ) {
-	char digits[NUM_DIGITS];
-	for( int8_t i = NUM_DIGITS - 1; i >= 0; i-- ) {
-		digits[i] = (char)('0' + value % 10);
-		value /= 10;
-	}
-	put_cmd( LCD_SET_ADDR( X_FIRST_ADDR ) );
-	for( uint8_t i = 0; i < NUM_DIGITS; i++ )
-		put_char( digits[i] );
-}
- 
-static void queue_y_hex( uint32_t value ) {
-	put_cmd( LCD_SET_ADDR( Y_FIRST_ADDR ) );
-	for( uint8_t i = 0; i < NUM_DIGITS; i++ )
-		put_char( hex_char( (value >> (28 - 4 * i)) & 0xF ) );
-}
- 
-static void queue_start_entry( void ) {
-	put_cmd( LCD_DISPLAY_BLINK_CURSOR );
-	put_cmd( LCD_SET_ADDR( X_FIRST_ADDR ) );
-	for( uint8_t i = 0; i < NUM_DIGITS; i++ )
-		put_char( ' ' );
-	put_cmd( LCD_SET_ADDR( X_FIRST_ADDR ) );
-}
- 
-static void app_fsm( void ) {
-	static enum { DISPLAY_MODE, ENTRY_MODE } mode = DISPLAY_MODE;
-	static uint8_t input[NUM_DIGITS];
-	static uint8_t index;
-	static uint32_t stored;
-	char c;
- 
-	flush_pending();
-	if( pending_pos < pending_len )
-		return;
-	if( !usbcdc_getchar( &c ) )
-		return;
- 
-	if( c == 'e' ) {                          
-		for( uint8_t i = 0; i < NUM_DIGITS; i++ )
-			input[i] = 0;
-		index = 0;
-		queue_start_entry();
-		mode = ENTRY_MODE;
-		return;
-	}
-	if( mode == DISPLAY_MODE )
-		return;                               
- 
-	if( c == '*' ) {                          
-		put_cmd( LCD_DISPLAY_NO_CURSOR );
-		queue_x_digits( stored );
-		mode = DISPLAY_MODE;
-	} else if( c == '\r' || c == '\n' ) {      
-		stored = 0;
-		for( uint8_t i = 0; i < NUM_DIGITS; i++ )
-			stored = stored * 10 + input[i];
-		put_cmd( LCD_DISPLAY_NO_CURSOR );
-		queue_x_digits( stored );
-		queue_y_hex( stored );
-		mode = DISPLAY_MODE;
-	} else if( c >= '0' && c <= '9' ) {
-		input[index] = (uint8_t)(c - '0');
-		put_char( c );
-		if( ++index == NUM_DIGITS ) {          
-			index = 0;
-			put_cmd( LCD_SET_ADDR( X_FIRST_ADDR ) );
-		}
-	}
-}
- 
 int main( void ) {
-	static const uint8_t init_cmds[] = { 0x32, 0x28, 0x10, LCD_DISPLAY_NO_CURSOR, 0x06, 0x01 };
- 
 	__disable_irq();
 	configure_led();
 	configure_usbcdc();
 	configure_lcd();
-	bool ok = register_systick_callback( lcd_fsm );
-	if( ok )
+	bool lcd_scheduled = register_systick_callback( lcd_fsm );
+	if( lcd_scheduled )
 		configure_systick();
- 
-	for( uint8_t i = 0; i < sizeof init_cmds; i++ )
-		lcd_command( init_cmds[i] );
-	lcd_command( LCD_SET_ADDR( 0x00 ) );
-	for( const char *p = "X: 00000000"; *p; p++ )
-		lcd_putchar( *p );
-	lcd_command( LCD_SET_ADDR( 0x40 ) );
-	for( const char *p = "Y: 00000000"; *p; p++ )
-		lcd_putchar( *p );
+	show_initial_screen();
 	__enable_irq();
- 
-	if( !ok ) {                                
+
+	if( !lcd_scheduled ) {
 		turn_on_led();
 		while( 1 )
 			continue;
 	}
- 
-	while( 1 )
-		app_fsm();
+
+	while( 1 ) {
+		char key;
+		if( lcd_free_fifo_entries() >= MAX_LCD_ENTRIES_PER_KEY && usbcdc_getchar( &key ) )
+			bcd_entry_fsm( key );
+	}
+}
+
+static void bcd_entry_fsm( char key ) {
+	static enum { DISPLAY_MODE, ENTRY_MODE } mode = DISPLAY_MODE;
+	static uint8_t entered_digits[NUM_DIGITS];
+	static uint8_t accepted_digits[NUM_DIGITS];
+	static uint8_t cursor_index;
+
+	if( key == 'e' ) {
+		for( uint8_t i = 0; i < NUM_DIGITS; i++ )
+			entered_digits[i] = 0;
+		cursor_index = 0;
+		start_digit_entry();
+		mode = ENTRY_MODE;
+		return;
+	}
+	if( mode == DISPLAY_MODE )
+		return;
+
+	if( key == '*' ) {
+		lcd_command( LCD_CURSOR_OFF );
+		show_digits( accepted_digits );
+		mode = DISPLAY_MODE;
+	} else if( key == '\r' || key == '\n' ) {
+		for( uint8_t i = 0; i < NUM_DIGITS; i++ )
+			accepted_digits[i] = entered_digits[i];
+		lcd_command( LCD_CURSOR_OFF );
+		show_digits( accepted_digits );
+		show_hex( digits_to_number( accepted_digits ) );
+		mode = DISPLAY_MODE;
+	} else if( key >= '0' && key <= '9' ) {
+		entered_digits[cursor_index] = (uint8_t)( key - '0' );
+		lcd_putchar( key );
+		if( ++cursor_index == NUM_DIGITS ) {
+			cursor_index = 0;
+			lcd_command( LCD_SET_ADDRESS( X_FIRST_DIGIT_ADDRESS ) );
+		}
+	}
+}
+
+static void show_initial_screen( void ) {
+	static const uint8_t lcd_init_commands[] = { LCD_FUNCTION_SET_4BIT_HANDSHAKE, LCD_FUNCTION_SET_4BIT_2LINE, LCD_CURSOR_SHIFT_LEFT,
+		LCD_CURSOR_OFF, LCD_ENTRY_MODE_INCREMENT, LCD_CLEAR_DISPLAY };
+	static const uint8_t zero_digits[NUM_DIGITS];
+
+	for( uint8_t i = 0; i < sizeof lcd_init_commands; i++ )
+		lcd_command( lcd_init_commands[i] );
+	lcd_command( LCD_SET_ADDRESS( LINE_1_ADDRESS ) );
+	show_text( "X: " );
+	show_digits( zero_digits );
+	lcd_command( LCD_SET_ADDRESS( LINE_2_ADDRESS ) );
+	show_text( "Y: " );
+	show_hex( 0 );
+}
+
+static void show_text( const char *text ) {
+	for( ; *text != '\0'; text++ )
+		lcd_putchar( *text );
+}
+
+static void show_digits( const uint8_t digits[NUM_DIGITS] ) {
+	lcd_command( LCD_SET_ADDRESS( X_FIRST_DIGIT_ADDRESS ) );
+	for( uint8_t i = 0; i < NUM_DIGITS; i++ )
+		lcd_putchar( (char)( '0' + digits[i] ) );
+}
+
+static void show_hex( uint32_t value ) {
+	lcd_command( LCD_SET_ADDRESS( Y_FIRST_DIGIT_ADDRESS ) );
+	for( uint8_t i = 0; i < NUM_DIGITS; i++ ) {
+		uint8_t shift = BITS_PER_HEX_DIGIT * ( NUM_DIGITS - 1 - i );
+		lcd_putchar( hex_digit_character( ( value >> shift ) & HEX_DIGIT_MASK ) );
+	}
+}
+
+static void start_digit_entry( void ) {
+	lcd_command( LCD_CURSOR_BLINKING );
+	lcd_command( LCD_SET_ADDRESS( X_FIRST_DIGIT_ADDRESS ) );
+	for( uint8_t i = 0; i < NUM_DIGITS; i++ )
+		lcd_putchar( ' ' );
+	lcd_command( LCD_SET_ADDRESS( X_FIRST_DIGIT_ADDRESS ) );
+}
+
+static uint32_t digits_to_number( const uint8_t digits[NUM_DIGITS] ) {
+	uint32_t number = 0;
+	for( uint8_t i = 0; i < NUM_DIGITS; i++ )
+		number = number * 10 + digits[i];
+	return number;
+}
+
+static char hex_digit_character( uint8_t value ) {
+	return ( value < 10 ) ? (char)( '0' + value ) : (char)( 'A' + ( value - 10 ) );
 }
